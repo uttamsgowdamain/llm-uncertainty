@@ -169,6 +169,3 @@ sbatch --dependency=afterany:$J2 3_V2_methodA_Ankith/v2_methodA.sbatch
 | Bad checkpoint after a crash | Crash during a save | Delete any `global_step_N` newer than `latest_checkpointed_iteration.txt` |
 | Edited job file has no effect | Slurm copies the file at submit time | `scancel` waiting jobs and resubmit |
 
-## AI use
-
-Parts of this setup were built with help from Claude. The course requires disclosing AI use with the full interaction trace, so keep your chat links for the report.
