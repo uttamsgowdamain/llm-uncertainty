@@ -1,0 +1,5 @@
+# never commit run outputs
+outputs/
+checkpoints/
+wandb/
+*.out
