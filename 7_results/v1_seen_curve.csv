@@ -1,0 +1,32 @@
+step,seen_success_pct,note
+0,9.3,untrained (val before training)
+5,11.4,
+10,7.1,
+15,15.7,
+20,15.0,
+25,15.0,
+30,21.4,resumed from checkpoint 30 after job 1 crash (job 1 had 24.3 at step 35)
+35,30.7,
+40,26.4,
+45,20.7,
+50,37.9,
+55,45.7,
+60,40.7,
+65,49.3,
+70,47.1,
+75,55.7,
+80,50.0,
+85,45.7,
+90,50.7,
+95,57.1,resumed from checkpoint 95 after CUDA OOM at step 96 (micro-batch 32 -> 16)
+100,62.9,
+105,61.4,
+110,58.6,
+115,71.4,
+120,62.1,
+125,65.7,
+130,63.6,
+135,70.7,
+140,71.4,
+145,70.0,
+150,70.7,final
