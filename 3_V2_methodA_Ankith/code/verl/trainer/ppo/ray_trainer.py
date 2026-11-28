@@ -1196,10 +1196,18 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
-                        if self.config.algorithm.get("uncertainty_method", "none") == "entropy":
-                            from verl.trainer.ppo.uncertainty import entropy_step_uncertainty, apply_failure_uncertainty_bonus
-                            step_u = entropy_step_uncertainty(token_entropys, response_masks)
-                            batch, u_metrics = apply_failure_uncertainty_bonus(batch, step_u, c=self.config.algorithm.get("uncertainty_c", 1.0))
+                        uncertainty_method = self.config.algorithm.get("uncertainty_method", "none")
+                        if uncertainty_method in ("entropy", "agreement", "both"):
+                            from verl.trainer.ppo.uncertainty import entropy_step_uncertainty, agreement_step_uncertainty, apply_failure_uncertainty_bonus
+                            if uncertainty_method == "entropy":  # Method A (V2)
+                                step_u = entropy_step_uncertainty(token_entropys, response_masks)
+                            elif uncertainty_method == "agreement":  # Method B (V3)
+                                step_u = agreement_step_uncertainty(batch)
+                            else:  # V4: average of A and B (per step, so also per attempt)
+                                step_u = 0.5 * (entropy_step_uncertainty(token_entropys, response_masks).float().cpu() + agreement_step_uncertainty(batch))
+                            batch, u_metrics = apply_failure_uncertainty_bonus(batch, step_u, c=self.config.algorithm.get("uncertainty_c", 1.0), skip_all_fail_groups=bool(self.config.algorithm.get("uncertainty_skip_all_fail_groups", False)))
+                            if uncertainty_method in ("agreement", "both"):
+                                u_metrics["uncertainty/agreement_u_step_mean"] = agreement_step_uncertainty(batch).mean().item()
                             metrics.update(u_metrics)
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")

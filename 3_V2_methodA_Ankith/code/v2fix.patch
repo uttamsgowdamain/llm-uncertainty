@@ -1,0 +1,238 @@
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index d79e678..071d82f 100644
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -25,6 +25,7 @@ from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict
+ from agent_system.environments import EnvironmentManagerBase
+ from typing import List, Dict
+ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
++from verl.trainer.ppo.uncertainty import agreement_uncertainty  # Method B (V3)
+ 
+ class TrajectoryCollector:
+     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
+@@ -39,6 +40,30 @@ class TrajectoryCollector:
+         self.config = config
+         self.tokenizer = tokenizer
+         self.processor = processor
++        self._agreement_on = False  # Method B (V3): set per call in multi_turn_loop
++
++    def _agreement_step_u(self, batch_input: DataProto, active_masks: np.ndarray, actor_rollout_wg) -> np.ndarray:
++        """Method B (V3): agreement uncertainty for one step.
++
++        For every still-active environment, sample K extra responses for the same
++        prompt (same sampling settings as the executed action), and return
++        u = 1 - (count of most common action) / K per row. Inactive rows get 0;
++        they are dropped later by gather_rollout_data anyway. The executed action
++        is not one of the K samples.
++        """
++        k = int(self.config.algorithm.get("agreement_k", 5))
++        u = np.zeros(len(active_masks), dtype=np.float32)
++        idx = np.nonzero(np.asarray(active_masks, dtype=bool))[0]
++        if len(idx) == 0 or k < 1:
++            return u
++        sub = batch_input.select_idxs(idx).repeat(repeat_times=k, interleave=True)
++        sub.meta_info = batch_input.meta_info
++        sub_padded, pad_size = pad_dataproto_to_divisor(sub, actor_rollout_wg.world_size)
++        sub_out = unpad_dataproto(actor_rollout_wg.generate_sequences(sub_padded), pad_size=pad_size)
++        texts = self.tokenizer.batch_decode(sub_out.batch['responses'], skip_special_tokens=True)
++        for j, row in enumerate(idx):
++            u[row] = agreement_uncertainty(texts[j * k:(j + 1) * k])
++        return u
+ 
+     def preprocess_single_sample(
+         self,
+@@ -358,6 +383,10 @@ class TrajectoryCollector:
+             batch.non_tensor_batch['uid'] = uid_batch
+             batch.non_tensor_batch['traj_uid'] = traj_uid
+ 
++            # Method B (V3): per-step agreement uncertainty from K extra samples
++            if self._agreement_on:
++                batch.non_tensor_batch['agreement_u'] = self._agreement_step_u(batch_input, active_masks, actor_rollout_wg)
++
+             batch = batch.union(batch_output)
+             
+             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+@@ -502,6 +531,11 @@ class TrajectoryCollector:
+         """
+         if is_train:
+             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
++
++        # Method B (V3): extra action samples only when the agreement signal is used.
++        # Training only by default; set +algorithm.agreement_in_val=True for the AUROC test-only pass.
++        method = self.config.algorithm.get("uncertainty_method", "none")
++        self._agreement_on = method in ("agreement", "both") and (is_train or bool(self.config.algorithm.get("agreement_in_val", False)))
+             
+         # Initial observations from the environment
+         if self.config.algorithm.filter_groups.enable and is_train:
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 16744c8..86965cb 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1196,10 +1196,18 @@ class RayPPOTrainer:
+                         if self.config.reward_model.launch_reward_fn_async:
+                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                         batch.batch["token_level_scores"] = reward_tensor
+-                        if self.config.algorithm.get("uncertainty_method", "none") == "entropy":
+-                            from verl.trainer.ppo.uncertainty import entropy_step_uncertainty, apply_failure_uncertainty_bonus
+-                            step_u = entropy_step_uncertainty(token_entropys, response_masks)
+-                            batch, u_metrics = apply_failure_uncertainty_bonus(batch, step_u, c=self.config.algorithm.get("uncertainty_c", 1.0))
++                        uncertainty_method = self.config.algorithm.get("uncertainty_method", "none")
++                        if uncertainty_method in ("entropy", "agreement", "both"):
++                            from verl.trainer.ppo.uncertainty import entropy_step_uncertainty, agreement_step_uncertainty, apply_failure_uncertainty_bonus
++                            if uncertainty_method == "entropy":  # Method A (V2)
++                                step_u = entropy_step_uncertainty(token_entropys, response_masks)
++                            elif uncertainty_method == "agreement":  # Method B (V3)
++                                step_u = agreement_step_uncertainty(batch)
++                            else:  # V4: average of A and B (per step, so also per attempt)
++                                step_u = 0.5 * (entropy_step_uncertainty(token_entropys, response_masks).float().cpu() + agreement_step_uncertainty(batch))
++                            batch, u_metrics = apply_failure_uncertainty_bonus(batch, step_u, c=self.config.algorithm.get("uncertainty_c", 1.0), skip_all_fail_groups=bool(self.config.algorithm.get("uncertainty_skip_all_fail_groups", False)))
++                            if uncertainty_method in ("agreement", "both"):
++                                u_metrics["uncertainty/agreement_u_step_mean"] = agreement_step_uncertainty(batch).mean().item()
+                             metrics.update(u_metrics)
+ 
+                         print(f"{list(reward_extra_infos_dict.keys())=}")
+diff --git a/verl/trainer/ppo/uncertainty.py b/verl/trainer/ppo/uncertainty.py
+index 776a3fb..f8ab18f 100644
+--- a/verl/trainer/ppo/uncertainty.py
++++ b/verl/trainer/ppo/uncertainty.py
+@@ -1,73 +1,107 @@
+-
+ import math
++import re
++from collections import Counter
+ 
+ import numpy as np
+-
+ import torch
+ 
+-
+-
+ # log of the logit dimension (Qwen2.5-1.5B: 151936). One shared constant for Methods A and B, all Versions.
+-
+ LOG_V = math.log(151936)
+ 
+ 
+-
+ def entropy_step_uncertainty(token_entropys, response_masks):
+-
+     # Method A: mean token entropy of each step's response, normalized to [0, 1]
+-
+     mean_h = (token_entropys * response_masks).sum(-1) / response_masks.sum(-1).clamp(min=1)
+-
+     return (mean_h / LOG_V).clamp(0.0, 1.0)
+ 
+ 
++def all_fail_group_mask(uid, ep_r):
++    """True for rows whose GRPO group (same uid = same task) has no successful attempt."""
++    uid = np.asarray(uid).reshape(-1)
++    ep_r = np.asarray(ep_r, dtype=np.float32).reshape(-1)
++    _, g = np.unique(uid, return_inverse=True)
++    g = g.reshape(-1)
++    group_best = np.full(g.max() + 1, -np.inf, dtype=np.float32)
++    np.maximum.at(group_best, g, ep_r)
++    return group_best[g] <= 0
+ 
+-def apply_failure_uncertainty_bonus(data, step_u, c=1.0):
+ 
++def apply_failure_uncertainty_bonus(data, step_u, c=1.0, skip_all_fail_groups=False):
+     # Shared slot for Methods A/B: failed trajectories get c * mean(step_u over the trajectory)
+-
++    # skip_all_fail_groups=True (fix for the V2/V3 stall): no bonus in groups where all attempts
++    # failed, since GRPO's std normalization would scale the bonus up to a full-size advantage there.
+     step_u = step_u.detach().float().cpu()
+-
+     traj = np.asarray(data.non_tensor_batch["traj_uid"])
+-
+     _, inv = np.unique(traj, return_inverse=True)
+-
+     inv = torch.as_tensor(inv.reshape(-1), dtype=torch.long)
+-
+     n = int(inv.max().item()) + 1
+-
+     sums = torch.zeros(n).index_add_(0, inv, step_u)
+-
+     cnts = torch.zeros(n).index_add_(0, inv, torch.ones_like(step_u))
+-
+     U = (sums / cnts)[inv]
+-
+     ep_r = torch.as_tensor(np.asarray(data.non_tensor_batch["episode_rewards"], dtype=np.float32).reshape(-1))
+-
+     fail = ep_r <= 0
+-
+-    bonus = c * U * fail.float()
+-
++    gets_bonus = fail
++    if skip_all_fail_groups:
++        all_fail = torch.as_tensor(all_fail_group_mask(data.non_tensor_batch["uid"], ep_r.numpy()))
++        gets_bonus = fail & ~all_fail
++    bonus = c * U * gets_bonus.float()
+     scores = data.batch["token_level_scores"]
+-
+     last = (data.batch["response_mask"].sum(-1).long().cpu() - 1).clamp(min=0)
+-
+     rows = torch.arange(len(bonus))
+-
+     scores[rows, last] += bonus.to(scores.dtype).to(scores.device)
+-
+     metrics = {
+-
+         "uncertainty/frac_fail_rows": fail.float().mean().item(),
+-
+         "uncertainty/U_mean_fail": U[fail].mean().item() if fail.any() else float("nan"),
+-
+         "uncertainty/U_mean_success": U[~fail].mean().item() if (~fail).any() else float("nan"),
+-
+         "uncertainty/bonus_mean_on_fail": bonus[fail].mean().item() if fail.any() else 0.0,
+-
++        "uncertainty/frac_rows_with_bonus": gets_bonus.float().mean().item(),
+     }
+-
+     return data, metrics
+ 
++
++# ---------------------------------------------------------------------------
++# Method B (Version 3): agreement uncertainty, Harshrajsinh
++#
++# At each step the policy samples K extra actions for the same state (done in
++# agent_system/multi_turn_rollout/rollout_loop.py). Each sample is reduced to
++# its action with normalize_action, and the step's uncertainty is
++#     u_t = 1 - (count of the most common action) / K
++# so u_t = 0 when all K samples agree and u_t = 1 - 1/K (0.8 for K = 5) when
++# all differ. apply_failure_uncertainty_bonus then averages u_t over the
++# attempt's steps (U_B in the report, Eq. 4).
++# ---------------------------------------------------------------------------
++
++INVALID_ACTION = "<invalid>"
++_ACTION_RE = re.compile(r"<action>(.*?)</action>", re.IGNORECASE | re.DOTALL)
++
++
++def normalize_action(text):
++    """Simple text normalization before comparing sampled actions.
++
++    Takes the first <action>...</action> block (as verl-agent's ALFWorld
++    projection does), lowercases it, collapses whitespace and drops trailing
++    punctuation. A sample with no action block is mapped to one shared
++    INVALID_ACTION label, so several unparsable samples count as agreeing.
++    """
++    m = _ACTION_RE.search(text or "")
++    if m is None:
++        return INVALID_ACTION
++    action = " ".join(m.group(1).lower().split()).rstrip(" .!")
++    return action if action else INVALID_ACTION
++
++
++def agreement_uncertainty(texts):
++    """u_t = 1 - max_a #{k : a_k = a} / K for one step's K sampled responses."""
++    if len(texts) == 0:
++        return 0.0
++    counts = Counter(normalize_action(t) for t in texts)
++    return 1.0 - max(counts.values()) / len(texts)
++
++
++def agreement_step_uncertainty(data):
++    """Method B per-row step_u for apply_failure_uncertainty_bonus.
++
++    Reads the per-step values that the rollout loop stored in
++    non_tensor_batch["agreement_u"].
++    """
++    return torch.as_tensor(np.asarray(data.non_tensor_batch["agreement_u"], dtype=np.float32).reshape(-1))
